@@ -1,0 +1,7 @@
+parameters:
+    ignoreErrors:
+        -
+            identifier: trait.unused
+            message: "#^Trait Daikazu\\\\EloquentSalesforceCache\\\\Concerns\\\\CachesSalesforceQueries is used zero times and is not analysed\\.$#"
+            path: src/Concerns/CachesSalesforceQueries.php
+            count: 1
