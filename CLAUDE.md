@@ -20,6 +20,7 @@ Two-layer caching strategy:
 - `src/Adapters/CachedSalesforceAdapter.php` — Layer 1 core, stampede protection via distributed locks
 - `src/Concerns/CachesSalesforceQueries.php` — Layer 2 trait for models
 - `src/Support/TagRegistry.php` — Redis-set-backed record-to-cache-key mapping
+- `src/Support/CacheKey.php` — Cache keys and tags; multi-object keys carry the objects they were tagged with
 - `src/Support/ModelDiscovery.php` — Auto-discovers models and builds cascade invalidation map
 - `src/Services/CacheInvalidator.php` — Unified invalidation entry point (API, CLI, programmatic)
 - `src/EloquentSalesforceCacheServiceProvider.php` — Service provider with booting-callback binding pattern

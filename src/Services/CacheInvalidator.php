@@ -6,6 +6,7 @@ namespace Daikazu\EloquentSalesforceCache\Services;
 
 use Daikazu\EloquentSalesforceCache\Enums\InvalidationScope;
 use Daikazu\EloquentSalesforceCache\Events\CacheInvalidated;
+use Daikazu\EloquentSalesforceCache\Support\CacheKey;
 use Daikazu\EloquentSalesforceCache\Support\TagRegistry;
 use Illuminate\Cache\Repository as CacheRepository;
 use Illuminate\Support\Facades\Cache;
@@ -133,12 +134,8 @@ class CacheInvalidator
     {
         [$resolved, $cacheKeys] = $this->resolveRecordKeys($object, $id);
 
-        if (! empty($cacheKeys)) {
-            $taggedStore = $this->cacheStore()->tags(['salesforce', $resolved]);
-
-            foreach ($cacheKeys as $cacheKey) {
-                $taggedStore->forget($cacheKey);
-            }
+        foreach ($cacheKeys as $cacheKey) {
+            $this->cacheStore()->tags(CacheKey::tagsForKey($cacheKey, $resolved))->forget($cacheKey);
         }
 
         $this->registry->remove($resolved, $id);
