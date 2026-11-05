@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Daikazu\EloquentSalesforceCache\Adapters;
 
 use Daikazu\EloquentSalesforceCache\Services\CacheInvalidator;
+use Daikazu\EloquentSalesforceCache\Support\CacheKey;
 use Daikazu\EloquentSalesforceCache\Support\ModelDiscovery;
 use Daikazu\EloquentSalesforceCache\Support\TagRegistry;
 use Daikazu\EloquentSalesforceObjects\Support\SalesforceAdapter;
@@ -32,6 +33,17 @@ class CachedSalesforceAdapter extends SalesforceAdapter
      * Matches: FROM ObjectName, FROM Namespace__ObjectName__c, etc.
      */
     private const string FROM_PATTERN = '/\bFROM\s+(\w+)/i';
+
+    /**
+     * Matches a parenthesised subquery, capturing everything after its SELECT.
+     * Balances nested parentheses, so functions and deeper subqueries stay inside it.
+     */
+    private const string SUBQUERY_PATTERN = '/\(\s*SELECT\b(?<body>(?:[^()]++|\((?&body)\))*+)\)/i';
+
+    /**
+     * Matches a quoted SOQL string, including backslash-escaped characters.
+     */
+    private const string STRING_LITERAL_PATTERN = "/'(?:[^'\\\\]|\\\\.)*+'/s";
 
     /**
      * Execute a SOQL query with transparent caching.
@@ -138,6 +150,19 @@ class CachedSalesforceAdapter extends SalesforceAdapter
     }
 
     /**
+     * Bulk upsert records by External Id and invalidate the object's cache.
+     */
+    #[Override]
+    public function bulkUpsert(string $object, string $externalIdField, array $records, bool $allOrNone = false): array
+    {
+        $result = parent::bulkUpsert($object, $externalIdField, $records, $allOrNone);
+        $this->safeInvalidateObject($object);
+        $this->safeCascadeInvalidation($object, $this->extractIdsFromBulkResult($result));
+
+        return $result;
+    }
+
+    /**
      * Bulk delete records and invalidate the object's cache.
      */
     #[Override]
@@ -219,12 +244,27 @@ class CachedSalesforceAdapter extends SalesforceAdapter
 
         $objectName = $this->extractObjectName($soql);
 
-        if ($objectName === null || $this->isObjectExcluded($objectName)) {
+        if ($objectName === null) {
             return $callback();
         }
 
-        $cacheKey = $this->buildCacheKey($type, $soql);
-        $tags = $this->buildTags($objectName);
+        try {
+            $relationships = $this->extractSubqueryObjects($soql, $objectName);
+        } catch (Throwable $e) {
+            // Without knowing what the query reads it could not be invalidated correctly
+            $this->log('Subquery resolution failed', ['object' => $objectName, 'error' => $e->getMessage()]);
+
+            return $callback();
+        }
+
+        $objects = array_values(array_unique([$objectName, ...array_values($relationships)]));
+
+        if (array_filter($objects, $this->isObjectExcluded(...)) !== []) {
+            return $callback();
+        }
+
+        $cacheKey = $this->buildCacheKey($type, $soql, $objects);
+        $tags = CacheKey::tags($objects);
         $ttl = $this->getTtl();
         $context = ['key' => $cacheKey, 'object' => $objectName, 'type' => $type];
 
@@ -254,7 +294,7 @@ class CachedSalesforceAdapter extends SalesforceAdapter
                 }
 
                 $result = $callback();
-                $this->safePut($tags, $cacheKey, $result, $ttl, $objectName);
+                $this->safePut($tags, $cacheKey, $result, $ttl, $objectName, $relationships);
 
                 return $result;
             } finally {
@@ -283,8 +323,14 @@ class CachedSalesforceAdapter extends SalesforceAdapter
     /**
      * Write to cache and register cache key per record in the TagRegistry.
      */
-    private function safePut(array $tags, string $cacheKey, array $result, int $ttl, string $objectName): void
+    private function safePut(array $tags, string $cacheKey, array $result, int $ttl, string $objectName, array $relationships = []): void
     {
+        // A partial page points at a query locator that Salesforce expires, so a later
+        // cache hit would fail when it asked for the next page.
+        if (! empty($result['nextRecordsUrl'])) {
+            return;
+        }
+
         try {
             $this->taggedStore($tags)->put($cacheKey, $result, $ttl);
         } catch (Throwable $e) {
@@ -293,17 +339,17 @@ class CachedSalesforceAdapter extends SalesforceAdapter
             return;
         }
 
-        $this->registerRecordKeys($objectName, $cacheKey, $result);
+        $this->registerRecordKeys($objectName, $cacheKey, $result['records'] ?? [], $relationships);
     }
 
     /**
-     * Extract record IDs from query results and register the cache key
-     * against each record in the TagRegistry for per-record invalidation.
+     * Register the cache key against each record in the results, and against the
+     * child records nested in them, for per-record invalidation.
+     *
+     * @param  array<string, string>  $relationships  Child relationship name => object name
      */
-    private function registerRecordKeys(string $objectName, string $cacheKey, array $result): void
+    private function registerRecordKeys(string $objectName, string $cacheKey, array $records, array $relationships = []): void
     {
-        $records = $result['records'] ?? [];
-
         if (empty($records)) {
             return;
         }
@@ -312,8 +358,18 @@ class CachedSalesforceAdapter extends SalesforceAdapter
             $registry = app(TagRegistry::class);
 
             foreach ($records as $record) {
-                if (is_array($record) && isset($record['Id'])) {
+                if (! is_array($record)) {
+                    continue;
+                }
+
+                if (isset($record['Id'])) {
                     $registry->register($objectName, (string) $record['Id'], $cacheKey);
+                }
+
+                foreach ($relationships as $relationship => $childObject) {
+                    if (is_array($record[$relationship] ?? null)) {
+                        $this->registerRecordKeys($childObject, $cacheKey, $record[$relationship], $relationships);
+                    }
                 }
             }
         } catch (Throwable $e) {
@@ -377,11 +433,13 @@ class CachedSalesforceAdapter extends SalesforceAdapter
     }
 
     /**
-     * Extract the Salesforce object name from a SOQL statement.
+     * Extract the object a SOQL statement selects from, ignoring any subqueries.
      */
     private function extractObjectName(string $soql): ?string
     {
-        if (preg_match(self::FROM_PATTERN, $soql, $matches)) {
+        $outer = preg_replace(self::SUBQUERY_PATTERN, '', $this->withoutStringLiterals($soql));
+
+        if (preg_match(self::FROM_PATTERN, (string) $outer, $matches)) {
             return $matches[1];
         }
 
@@ -389,23 +447,81 @@ class CachedSalesforceAdapter extends SalesforceAdapter
     }
 
     /**
+     * Find the objects read by a statement's subqueries, such as the child subqueries
+     * that with() sends and semi-joins in a WHERE clause.
+     *
+     * @return array<string, string> Name used in the FROM clause => object name
+     *
+     * @throws Throwable When describe metadata is needed but can't be fetched
+     */
+    private function extractSubqueryObjects(string $soql, string $parent): array
+    {
+        preg_match_all(self::SUBQUERY_PATTERN, $this->withoutStringLiterals($soql), $matches);
+
+        $objects = [];
+
+        foreach ($matches['body'] as $body) {
+            $subquery = 'SELECT' . $body;
+            $name = $this->extractObjectName($subquery);
+
+            if ($name === null) {
+                continue;
+            }
+
+            [$name, $object] = $this->resolveRelationship($parent, $name);
+
+            $objects[$name] = $object;
+            $objects += $this->extractSubqueryObjects($subquery, $object);
+        }
+
+        return $objects;
+    }
+
+    /**
+     * A child subquery selects from a relationship ("Contacts"), which describe metadata
+     * maps to its object ("Contact"). A semi-join already selects from the object itself.
+     *
+     * @return array{0: string, 1: string} Relationship name as Salesforce returns it, and object name
+     *
+     * @throws Throwable
+     */
+    private function resolveRelationship(string $parent, string $name): array
+    {
+        foreach ($this->describe($parent)['childRelationships'] ?? [] as $relationship) {
+            if (strcasecmp($relationship['relationshipName'] ?? '', $name) === 0) {
+                return [$relationship['relationshipName'], $relationship['childSObject']];
+            }
+        }
+
+        return [$name, $name];
+    }
+
+    /**
+     * Blank out quoted strings so their contents can't be mistaken for SOQL.
+     */
+    private function withoutStringLiterals(string $soql): string
+    {
+        return (string) preg_replace(self::STRING_LITERAL_PATTERN, "''", $soql);
+    }
+
+    /**
      * Build the cache key for a given query type and SOQL string.
      *
-     * Format: sf_cache:{type}:{md5_of_soql}
+     * @param  string[]  $objects  Every object the query reads, root object first
      */
-    private function buildCacheKey(string $type, string $soql): string
+    private function buildCacheKey(string $type, string $soql, array $objects = []): string
     {
-        return 'sf_cache:' . $type . ':' . md5($soql);
+        return CacheKey::make($type, $soql, $objects);
     }
 
     /**
      * Build cache tags for the given Salesforce object.
      *
-     * @return array{0: 'salesforce', 1: string}
+     * @return string[]
      */
     private function buildTags(string $objectName): array
     {
-        return ['salesforce', $objectName];
+        return CacheKey::tags([$objectName]);
     }
 
     /**

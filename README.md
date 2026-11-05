@@ -30,9 +30,9 @@ Redis-backed caching layer for `daikazu/eloquent-salesforce-objects`. Transparen
 
 | Dependency | Version |
 |---|---|
-| PHP | ^8.2 |
+| PHP | ^8.4 |
 | Laravel | ^12.0 or ^13.0 |
-| daikazu/eloquent-salesforce-objects | ^1.0 |
+| daikazu/eloquent-salesforce-objects | ^2.0.1 |
 | Redis | Any version supporting cache tags |
 
 Redis is required. The Laravel cache driver must be set to `redis` (or another tagged-cache-compatible driver) for the store this package targets. Laravel's file and database cache drivers do not support cache tags.
@@ -162,28 +162,38 @@ The package implements a two-layer caching strategy. Layer 1 operates automatica
 1. The SOQL string is examined to extract the Salesforce object name from the `FROM` clause.
 2. If the object is excluded or caching is disabled, the query passes through to Salesforce directly.
 3. The SOQL string is hashed (`md5`) to produce a cache key in the format `sf_cache:{type}:{hash}`.
-4. The cache is checked using tags `['salesforce', '{ObjectName}']`.
-5. On a cache miss, a distributed lock (`sf_lock:{cacheKey}`) is acquired to prevent cache stampede — only one process queries Salesforce; others wait up to 5 seconds and then re-check the cache.
-6. The result is stored with the configured TTL.
+4. The cache is checked using tags `['salesforce', '{ObjectName}']`, plus any objects read by subqueries.
+5. On a cache miss, a distributed lock (`sf_lock:{cacheKey}`) is acquired to prevent cache stampede — only one process queries Salesforce; any process that can't get the lock queries Salesforce directly without caching the result.
+6. The result is stored with the configured TTL. A partial result with a `nextRecordsUrl` (more than one page of records) is not cached, because Salesforce expires its query locator.
 
 **Write-through invalidation:**
 
-When any mutation method is called (`create`, `update`, `delete`, `upsert`, `bulkCreate`, `bulkUpdate`, `bulkDelete`), the adapter executes the operation first and then flushes the cache tag for that object type. All cached queries for that object are invalidated atomically.
+When any mutation method is called (`create`, `update`, `delete`, `upsert`, `bulkCreate`, `bulkUpdate`, `bulkUpsert`, `bulkDelete`), the adapter executes the operation first and then flushes the tags `['salesforce', '{ObjectName}']`. Flushing those tags together clears every entry under `salesforce`, so a write clears the whole Salesforce cache, not only that object's queries.
+
+**Subqueries:**
+
+`with()` loads `hasMany` / `hasOne` children in one query: `select Id, (select Id from Contacts) from Account`. The adapter tags that entry with both objects, using describe metadata to turn the relationship name `Contacts` into the object `Contact`, and registers the child records too. Invalidating `Account` or `Contact`, at object or record level, clears it. Semi-joins (`where Id in (select AccountId from Contact)`) work the same way.
+
+If any object in the query is in `exclude_objects`, or the relationship names can't be resolved, the query goes to Salesforce uncached.
 
 **Cache key format:**
 
 ```
 sf_cache:query:{md5_of_soql_string}
 sf_cache:queryAll:{md5_of_soql_string}
+sf_cache:query:{md5_of_soql_string}:Account,Contact    (query with subqueries)
 ```
 
 **Cache tags:**
 
 ```
 ['salesforce', 'Opportunity']
+['salesforce', 'Account', 'Contact']    (query with subqueries)
 ```
 
-Flushing the `salesforce` tag clears all Salesforce cache. Flushing the `Opportunity` tag clears only Opportunity queries.
+`CacheInvalidator::invalidateAll()` clears all Salesforce cache. `CacheInvalidator::invalidateObject('Opportunity')` clears only entries tagged `Opportunity`, including queries on other objects that read Opportunity through a subquery.
+
+Parent fields read with dot notation (`select Account.Name from Contact`) are not tracked. After an external change to the Account, invalidate `Contact` as well.
 
 ### Layer 2: Opt-In Per-Record Tagging
 
